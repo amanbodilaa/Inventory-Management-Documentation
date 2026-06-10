@@ -1,6 +1,6 @@
 # Inventory Management System — Complete System Design Document
 
-**Version:** 1.2  
+**Version:** 1.3  
 **Author:** Aman Bodila  
 **Date:** May 2026  
 **Stack:** Spring Boot 3.x (Java 21) + Angular 21 + PostgreSQL + Redis + Kafka  
@@ -39,11 +39,12 @@
 25. [API Endpoint Master List](#25-api-endpoint-master-list)
 26. [Final Summary](#26-final-summary)
 27. [Idempotency — Preventing Duplicate Processing](#27-idempotency--preventing-duplicate-processing)
-28. [Database Migrations with Flyway](#28-database-migrations-with-flyway)
+28. [Database Migrations with Liquibase](#28-database-migrations-with-liquibase)
 29. [Logging Standard](#29-logging-standard)
 30. [Health Checks](#30-health-checks)
 31. [Simplified Observability](#31-simplified-observability-what-you-can-do-solo)
 32. [Updated Final Summary](#32-updated-final-summary)
+33. [Testing Strategy](#33-testing-strategy)
 
 ---
 
@@ -2211,6 +2212,8 @@ P10: Polish                                                                     
 | **9. Notification** | 31-33 | 2.5 weeks | Templates, Kafka consumers, WebSocket, email, Angular |
 | **10. Integration & Polish** | 33.5-35 | 2.5 weeks | E2E testing, bug fixes, UI polish |
 
+> **Testing is not a separate phase.** Following the strategy in [Section 33](#33-testing-strategy), unit tests (JUnit 5 + Mockito) and integration tests (Testcontainers) are written alongside each service as it is built. Phase 10 focuses on end-to-end flows across services, not first-time test authoring.
+
 ### 24.4 Demoable Milestones
 
 | Week | Demo |
@@ -2520,7 +2523,7 @@ Consumers that only READ (like updating a dashboard cache) can skip this — wor
 
 ---
 
-## 28. Database Migrations with Flyway
+## 28. Database Migrations with Liquibase
 
 ### 28.1 The Problem
 
@@ -2530,62 +2533,111 @@ You have 36 tables across 9 databases. As you develop, you'll change schemas (ad
 - Your local DB doesn't match your teammate's (or your Docker DB)
 - Recreating the DB from scratch means running 50 SQL scripts in the right order
 
-### 28.2 The Solution: Flyway
+### 28.2 The Solution: Liquibase
 
-Flyway is a database migration tool. You write numbered SQL files, and Flyway runs them in order on startup.
+Liquibase is a database migration tool. You describe schema changes as ordered **changesets** inside changelog files, and Liquibase applies any that haven't run yet on startup. Changelogs can be authored in YAML, XML, JSON, or plain SQL — this project uses YAML for the master changelog and references SQL changesets where raw SQL is clearer.
 
 ```
-src/main/resources/db/migration/
-├── V1__create_products_table.sql
-├── V2__create_categories_table.sql
-├── V3__add_hsn_code_to_products.sql
-├── V4__create_product_attributes_table.sql
-└── V5__add_index_on_sku.sql
+src/main/resources/db/changelog/
+├── db.changelog-master.yaml          (master — includes all changesets in order)
+├── changes/
+│   ├── 001-create-products-table.yaml
+│   ├── 002-create-categories-table.yaml
+│   ├── 003-add-hsn-code-to-products.yaml
+│   ├── 004-create-product-attributes-table.yaml
+│   └── 005-add-index-on-sku.yaml
 ```
 
-**Flyway guarantees:**
-- Scripts run in order (V1 before V2)
-- Each script runs exactly once (tracked in `flyway_schema_history` table)
-- If a script fails, the migration stops (no half-applied changes)
+**Liquibase guarantees:**
+- Changesets run in the order declared in the master changelog
+- Each changeset runs exactly once (tracked in the `DATABASECHANGELOG` table)
+- A `DATABASECHANGELOGLOCK` table prevents two instances from migrating simultaneously
+- If a changeset fails, the migration stops (no half-applied changes)
+- Every applied changeset is checksummed, so accidental edits to already-applied changesets are detected
 
 ### 28.3 Setup (Per Service)
 
 **Dependency:**
 ```xml
 <dependency>
-    <groupId>org.flywaydb</groupId>
-    <artifactId>flyway-core</artifactId>
+    <groupId>org.liquibase</groupId>
+    <artifactId>liquibase-core</artifactId>
 </dependency>
 ```
 
 **application.yml:**
 ```yaml
 spring:
-  flyway:
+  liquibase:
     enabled: true
-    locations: classpath:db/migration
+    change-log: classpath:db/changelog/db.changelog-master.yaml
 ```
 
-That's it. On startup, Flyway checks which migrations have been applied and runs any new ones.
+That's it. On startup, Liquibase reads the master changelog, checks the `DATABASECHANGELOG` table to see which changesets have already been applied, and runs any new ones.
+
+**Master changelog (`db.changelog-master.yaml`):**
+```yaml
+databaseChangeLog:
+  - include:
+      file: db/changelog/changes/001-create-products-table.yaml
+  - include:
+      file: db/changelog/changes/002-create-categories-table.yaml
+  - include:
+      file: db/changelog/changes/003-add-hsn-code-to-products.yaml
+```
+
+**Example changeset (`001-create-products-table.yaml`):**
+```yaml
+databaseChangeLog:
+  - changeSet:
+      id: 001-create-products-table
+      author: aman.bodila
+      changes:
+        - createTable:
+            tableName: products
+            columns:
+              - column:
+                  name: id
+                  type: uuid
+                  constraints:
+                    primaryKey: true
+                    nullable: false
+              - column:
+                  name: sku
+                  type: varchar(64)
+                  constraints:
+                    nullable: false
+                    unique: true
+              - column:
+                  name: name
+                  type: varchar(255)
+                  constraints:
+                    nullable: false
+```
 
 ### 28.4 Naming Convention
 
 ```
-V{version}__{description}.sql
+{sequence}-{description}.yaml          (changelog file)
+id: {sequence}-{description}           (changeSet id, unique per author)
+author: {developer}                    (changeSet author)
 
 Examples:
-V1__create_users_table.sql
-V2__create_roles_table.sql
-V3__add_phone_to_users.sql
-V4__create_index_on_email.sql
+001-create-users-table.yaml
+002-create-roles-table.yaml
+003-add-phone-to-users.yaml
+004-create-index-on-email.yaml
 ```
 
 **Rules:**
-- Never edit a migration that's already been applied (create a new one instead)
-- Version numbers must be sequential
-- Double underscore `__` between version and description
+- Never edit a changeset that's already been applied — Liquibase validates checksums and will fail. Create a new changeset instead.
+- The combination of `id` + `author` + file path must be unique; keep sequence numbers ordered.
+- One logical change per changeset (one table, one column, one index) so failures are easy to isolate and roll back.
+- Prefer Liquibase's structured change types (`createTable`, `addColumn`, `createIndex`) for database-portable migrations; drop to a raw `sql` changeset only when necessary.
 
 ---
+
+
 
 ## 29. Logging Standard
 
@@ -2761,10 +2813,555 @@ Access at `http://localhost:9000` — see all topics, browse messages, check con
 | GST Tax Engine | Invoice Service |
 | Discount Rules Engine | Invoice Service |
 | **Idempotent Consumers** | All Kafka consumers (new) |
-| **Database Migrations** | Flyway in all services (new) |
+| **Database Migrations** | Liquibase in all services (new) |
 | **Structured Logging** | JSON logs + Correlation ID (new) |
 | **Health Checks** | Spring Actuator in all services (new) |
+| **Layered Testing** | JUnit 5 + Mockito + Testcontainers in all services (new) |
 
 ---
 
-*End of Document — v1.2*
+## 33. Testing Strategy
+
+### 33.1 Overview
+
+With 11 services, untested code becomes a liability fast. A broken Kafka consumer or a wrong GST calculation can silently corrupt data across multiple services. This section defines a **practical, layered testing strategy** suited for a solo developer.
+
+The goal is not 100% coverage — it is **confidence at the boundaries**: service logic, API contracts, Kafka events, and database operations.
+
+| Layer | Tool | What It Tests |
+|-------|------|---------------|
+| Unit Tests | JUnit 5 + Mockito | Business logic in isolation |
+| Integration Tests | Testcontainers + Spring Boot Test | Service + real DB + real Kafka |
+| API/Slice Tests | MockMvc + `@WebMvcTest` | Controller layer, request/response validation |
+| Contract Tests | Spring Cloud Contract | Inter-service API contracts |
+| End-to-End (Manual) | Postman Collections | Full flow across services |
+
+---
+
+### 33.2 Dependencies (Add to Every Service's pom.xml)
+
+```xml
+<!-- JUnit 5 + Mockito — Unit testing -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+    <!-- Includes: JUnit 5, Mockito, AssertJ, Hamcrest -->
+</dependency>
+
+<!-- Testcontainers — Real DB + Kafka in tests -->
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>postgresql</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.testcontainers</groupId>
+    <artifactId>kafka</artifactId>
+    <scope>test</scope>
+</dependency>
+
+<!-- Testcontainers BOM — version management -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>testcontainers-bom</artifactId>
+            <version>1.19.7</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+```
+
+---
+
+### 33.3 Unit Testing — Business Logic
+
+Unit tests run **without Spring context**. They test a single class in complete isolation using Mockito to mock dependencies. These are the fastest tests — run in milliseconds.
+
+**What to unit test in this project:**
+- Service layer methods (OrderService, InventoryService, InvoiceService, etc.)
+- GST calculation logic (critical — a wrong tax is a real business bug)
+- Discount rules engine
+- Order state machine transitions
+- Customer credit limit checks
+
+#### Example: InventoryService — Reserve Stock
+
+```java
+@ExtendWith(MockitoExtension.class)
+class InventoryServiceTest {
+
+    @Mock
+    private StockRepository stockRepository;
+
+    @Mock
+    private KafkaEventPublisher eventPublisher;
+
+    @InjectMocks
+    private InventoryService inventoryService;
+
+    @Test
+    @DisplayName("Should reserve stock successfully when sufficient quantity available")
+    void shouldReserveStock_whenSufficientQuantityAvailable() {
+        // Arrange
+        String productId = "PROD-001";
+        int requestedQty = 10;
+
+        StockLevel stock = StockLevel.builder()
+            .productId(productId)
+            .availableQty(50)
+            .reservedQty(5)
+            .build();
+
+        when(stockRepository.findByProductId(productId))
+            .thenReturn(Optional.of(stock));
+        when(stockRepository.save(any(StockLevel.class)))
+            .thenAnswer(i -> i.getArgument(0));
+
+        // Act
+        StockReservationResult result = inventoryService.reserveStock(productId, requestedQty);
+
+        // Assert
+        assertThat(result.isSuccess()).isTrue();
+        assertThat(stock.getReservedQty()).isEqualTo(15); // 5 existing + 10 new
+        assertThat(stock.getAvailableQty()).isEqualTo(40); // 50 - 10
+
+        verify(eventPublisher).publish(argThat(event ->
+            event.getType().equals("stock.reserved") &&
+            event.getProductId().equals(productId)
+        ));
+    }
+
+    @Test
+    @DisplayName("Should throw InsufficientStockException when quantity unavailable")
+    void shouldThrowException_whenInsufficientStock() {
+        // Arrange
+        StockLevel stock = StockLevel.builder()
+            .productId("PROD-001")
+            .availableQty(5)
+            .build();
+
+        when(stockRepository.findByProductId("PROD-001"))
+            .thenReturn(Optional.of(stock));
+
+        // Act + Assert
+        assertThatThrownBy(() -> inventoryService.reserveStock("PROD-001", 10))
+            .isInstanceOf(InsufficientStockException.class)
+            .hasMessageContaining("Insufficient stock");
+
+        verify(eventPublisher, never()).publish(any());
+    }
+}
+```
+
+#### Example: GSTCalculationService — Tax Engine
+
+```java
+@ExtendWith(MockitoExtension.class)
+class GSTCalculationServiceTest {
+
+    @InjectMocks
+    private GSTCalculationService gstService;
+
+    @Test
+    @DisplayName("Should apply CGST + SGST for intra-state transaction")
+    void shouldApplyCGSTAndSGST_forIntraStateTransaction() {
+        InvoiceLineItem item = InvoiceLineItem.builder()
+            .baseAmount(new BigDecimal("10000.00"))
+            .gstRate(new BigDecimal("18"))
+            .supplierStateCode("GJ")
+            .customerStateCode("GJ") // Same state → CGST + SGST
+            .build();
+
+        GSTBreakdown breakdown = gstService.calculate(item);
+
+        assertThat(breakdown.getCgst()).isEqualByComparingTo("900.00");  // 9%
+        assertThat(breakdown.getSgst()).isEqualByComparingTo("900.00");  // 9%
+        assertThat(breakdown.getIgst()).isEqualByComparingTo("0.00");
+        assertThat(breakdown.getTotalTax()).isEqualByComparingTo("1800.00");
+    }
+
+    @Test
+    @DisplayName("Should apply IGST for inter-state transaction")
+    void shouldApplyIGST_forInterStateTransaction() {
+        InvoiceLineItem item = InvoiceLineItem.builder()
+            .baseAmount(new BigDecimal("10000.00"))
+            .gstRate(new BigDecimal("18"))
+            .supplierStateCode("GJ")
+            .customerStateCode("MH") // Different state → IGST
+            .build();
+
+        GSTBreakdown breakdown = gstService.calculate(item);
+
+        assertThat(breakdown.getIgst()).isEqualByComparingTo("1800.00"); // 18%
+        assertThat(breakdown.getCgst()).isEqualByComparingTo("0.00");
+        assertThat(breakdown.getSgst()).isEqualByComparingTo("0.00");
+    }
+}
+```
+
+---
+
+### 33.4 Integration Testing — With Testcontainers
+
+Integration tests spin up **real Docker containers** (PostgreSQL, Kafka) during the test run. They test the full stack of one service: Controller → Service → Repository → Real DB.
+
+**Why Testcontainers over H2?**
+- H2 in-memory DB behaves differently from PostgreSQL (different SQL dialect, missing features)
+- Testcontainers gives you the exact same database your app runs against
+- Kafka cannot be meaningfully replaced with an in-memory mock
+
+#### Base Test Configuration (Reusable Across All Services)
+
+```java
+// AbstractIntegrationTest.java — extend this in all integration tests
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@Testcontainers
+@ActiveProfiles("test")
+public abstract class AbstractIntegrationTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine")
+        .withDatabaseName("test_db")
+        .withUsername("test")
+        .withPassword("test");
+
+    @Container
+    static KafkaContainer kafka = new KafkaContainer(
+        DockerImageName.parse("confluentinc/cp-kafka:7.6.0")
+    );
+
+    @DynamicPropertySource
+    static void overrideProperties(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", postgres::getJdbcUrl);
+        registry.add("spring.datasource.username", postgres::getUsername);
+        registry.add("spring.datasource.password", postgres::getPassword);
+        registry.add("spring.kafka.bootstrap-servers", kafka::getBootstrapServers);
+    }
+}
+```
+
+#### Example: OrderService Integration Test
+
+```java
+class OrderServiceIntegrationTest extends AbstractIntegrationTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @Autowired
+    private OrderRepository orderRepository;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+    @Test
+    @DisplayName("POST /api/orders — Should create sales order and return 201")
+    void shouldCreateSalesOrder_andReturn201() throws Exception {
+        CreateSalesOrderRequest request = CreateSalesOrderRequest.builder()
+            .customerId("CUST-001")
+            .items(List.of(
+                OrderItemRequest.builder()
+                    .productId("PROD-001")
+                    .quantity(5)
+                    .unitPrice(new BigDecimal("1000.00"))
+                    .build()
+            ))
+            .build();
+
+        mockMvc.perform(post("/api/orders")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(request))
+                .header("X-User-Id", "USER-001")
+                .header("X-User-Permissions", "ORDER_CREATE"))
+            .andExpect(status().isCreated())
+            .andExpect(jsonPath("$.success").value(true))
+            .andExpect(jsonPath("$.data.status").value("CONFIRMED"))
+            .andExpect(jsonPath("$.data.orderNumber").value(startsWith("SO-")));
+
+        // Verify persisted in DB
+        assertThat(orderRepository.count()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("POST /api/orders — Should return 422 when customer is blocked")
+    void shouldReturn422_whenCustomerIsBlocked() throws Exception {
+        // ... setup blocked customer scenario
+        // ... assert 422 with correct error code ORD_006
+    }
+}
+```
+
+---
+
+### 33.5 Kafka Consumer Testing
+
+Kafka consumers are critical and easy to get wrong. Test that your consumers correctly process events and handle duplicates (idempotency).
+
+```java
+@SpringBootTest
+@EmbeddedKafka(
+    partitions = 1,
+    topics = {"order.placed", "stock.reserved"},
+    brokerProperties = {"listeners=PLAINTEXT://localhost:9093", "port=9093"}
+)
+class InventoryKafkaConsumerTest {
+
+    @Autowired
+    private KafkaTemplate<String, String> kafkaTemplate;
+
+    @Autowired
+    private StockRepository stockRepository;
+
+    @Autowired
+    private ProcessedEventRepository processedEventRepository;
+
+    @Test
+    @DisplayName("Should reserve stock when order.placed event is consumed")
+    void shouldReserveStock_whenOrderPlacedEventReceived() throws Exception {
+        // Arrange — pre-populate stock
+        stockRepository.save(StockLevel.builder()
+            .productId("PROD-001").availableQty(100).reservedQty(0).build());
+
+        String event = """
+            {
+              "eventId": "evt-001",
+              "orderId": "SO-001",
+              "items": [{"productId": "PROD-001", "quantity": 10}]
+            }
+            """;
+
+        // Act
+        kafkaTemplate.send("order.placed", event);
+
+        // Assert — wait for consumer to process
+        await().atMost(10, SECONDS).untilAsserted(() -> {
+            StockLevel stock = stockRepository.findByProductId("PROD-001").orElseThrow();
+            assertThat(stock.getReservedQty()).isEqualTo(10);
+            assertThat(stock.getAvailableQty()).isEqualTo(90);
+        });
+    }
+
+    @Test
+    @DisplayName("Should skip duplicate event (idempotency check)")
+    void shouldSkipDuplicateEvent_whenSameEventIdReceivedTwice() throws Exception {
+        // Mark event as already processed
+        processedEventRepository.save(
+            ProcessedEvent.builder().eventId("evt-duplicate-001").build()
+        );
+
+        String duplicateEvent = """
+            {"eventId": "evt-duplicate-001", "orderId": "SO-002", ...}
+            """;
+
+        kafkaTemplate.send("order.placed", duplicateEvent);
+
+        await().atMost(5, SECONDS).untilAsserted(() -> {
+            // Stock should NOT be modified — event was skipped
+            assertThat(stockRepository.findAll()).isEmpty();
+        });
+    }
+}
+```
+
+---
+
+### 33.6 Controller (Slice) Testing — `@WebMvcTest`
+
+Use `@WebMvcTest` when you want to test only the **controller layer** — request validation, response format, HTTP status codes — without starting the full application context. Faster than full integration tests.
+
+```java
+@WebMvcTest(ProductController.class)
+class ProductControllerTest {
+
+    @Autowired
+    private MockMvc mockMvc;
+
+    @MockBean
+    private ProductService productService;
+
+    @Test
+    @DisplayName("GET /api/products/{id} — Should return 404 with correct error body")
+    void shouldReturn404_whenProductNotFound() throws Exception {
+        when(productService.findById("PROD-999"))
+            .thenThrow(new ProductNotFoundException("PROD-999"));
+
+        mockMvc.perform(get("/api/products/PROD-999")
+                .header("X-User-Id", "USER-001"))
+            .andExpect(status().isNotFound())
+            .andExpect(jsonPath("$.success").value(false))
+            .andExpect(jsonPath("$.errorCode").value("PRD_001"))
+            .andExpect(jsonPath("$.message").exists());
+    }
+
+    @Test
+    @DisplayName("POST /api/products — Should return 400 when SKU is blank")
+    void shouldReturn400_whenSKUIsBlank() throws Exception {
+        String invalidRequest = """
+            {"name": "Test Product", "sku": "", "price": 100}
+            """;
+
+        mockMvc.perform(post("/api/products")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(invalidRequest))
+            .andExpect(status().isBadRequest())
+            .andExpect(jsonPath("$.errorCode").value("VALIDATION_ERROR"));
+    }
+}
+```
+
+---
+
+### 33.7 Repository Testing — `@DataJpaTest`
+
+Test your custom JPA queries and Liquibase migrations without starting the full app.
+
+```java
+@DataJpaTest
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+@Testcontainers
+class StockRepositoryTest {
+
+    @Container
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:16-alpine");
+
+    @DynamicPropertySource
+    static void props(DynamicPropertyRegistry r) {
+        r.add("spring.datasource.url", postgres::getJdbcUrl);
+        r.add("spring.datasource.username", postgres::getUsername);
+        r.add("spring.datasource.password", postgres::getPassword);
+    }
+
+    @Autowired
+    private StockRepository stockRepository;
+
+    @Test
+    @DisplayName("Should find all products below reorder level")
+    void shouldFindProductsBelowReorderLevel() {
+        stockRepository.saveAll(List.of(
+            StockLevel.builder().productId("P1").availableQty(5).reorderLevel(10).build(),
+            StockLevel.builder().productId("P2").availableQty(20).reorderLevel(10).build(),
+            StockLevel.builder().productId("P3").availableQty(3).reorderLevel(15).build()
+        ));
+
+        List<StockLevel> lowStock = stockRepository.findAllBelowReorderLevel();
+
+        assertThat(lowStock).hasSize(2)
+            .extracting(StockLevel::getProductId)
+            .containsExactlyInAnyOrder("P1", "P3");
+    }
+}
+```
+
+---
+
+### 33.8 Testing Per Service — What to Cover
+
+| Service | Critical Tests to Write |
+|---------|------------------------|
+| **Auth Service** | Login success/fail, JWT generation, refresh token rotation, expired token rejection |
+| **Product Service** | Create product with valid/invalid data, duplicate SKU rejection, image upload |
+| **Inventory Service** | Reserve stock, release stock, insufficient stock exception, idempotent consumer, reorder alert |
+| **Order Service** | Sales order creation, purchase order state transitions, customer blocked scenario, idempotent consumer |
+| **Report & Invoice Service** | GST calculation (CGST/SGST vs IGST), discount application, invoice auto-generation from event |
+| **Customer Service** | Credit limit check, ledger debit/credit, account balance calculation |
+| **Notification Service** | Template rendering, Kafka event consumption, duplicate notification prevention |
+| **API Gateway** | JWT validation, rate limiting, route not found |
+
+---
+
+### 33.9 Test Folder Structure (Per Service)
+
+```
+src/test/java/com/inventory/order/
+├── unit/
+│   ├── service/
+│   │   ├── OrderServiceTest.java          (pure unit, Mockito)
+│   │   └── OrderStateManagerTest.java     (state machine logic)
+│   └── util/
+│       └── OrderNumberGeneratorTest.java
+├── integration/
+│   ├── AbstractIntegrationTest.java       (shared Testcontainers base)
+│   ├── OrderServiceIntegrationTest.java   (full stack with real DB)
+│   └── OrderKafkaConsumerTest.java        (Kafka event handling)
+└── slice/
+    └── OrderControllerTest.java           (@WebMvcTest — controller only)
+```
+
+---
+
+### 33.10 Coverage Targets (Practical, Not Perfectionist)
+
+| Layer | Target Coverage | Why |
+|-------|----------------|-----|
+| Service layer (business logic) | **80%+** | This is where bugs live |
+| Controller layer | **70%+** | Validate request/response contracts |
+| Repository layer | **60%+** | Custom queries only, skip auto-generated |
+| Kafka consumers | **100% of happy path + idempotency** | Silent failures are dangerous |
+| GST / Discount engine | **100% of all tax slabs and rules** | Financial correctness is non-negotiable |
+| Utility/helper classes | **90%+** | Usually pure functions, easy to test |
+
+> Don't chase 100% overall coverage. One well-written integration test covering the `order.placed → reserve stock → stock.reserved` flow is worth more than 20 trivial getter/setter tests.
+
+---
+
+### 33.11 Running Tests
+
+```bash
+# Run all unit tests (fast, no Docker needed)
+mvn test -Dtest="**/unit/**"
+
+# Run all integration tests (requires Docker for Testcontainers)
+mvn test -Dtest="**/integration/**"
+
+# Run all tests with coverage report
+mvn verify
+
+# Run tests for a specific service
+cd order-service && mvn test
+
+# View coverage report
+open target/site/jacoco/index.html
+```
+
+**Add JaCoCo for coverage reports:**
+
+```xml
+<plugin>
+    <groupId>org.jacoco</groupId>
+    <artifactId>jacoco-maven-plugin</artifactId>
+    <version>0.8.11</version>
+    <executions>
+        <execution>
+            <goals><goal>prepare-agent</goal></goals>
+        </execution>
+        <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals><goal>report</goal></goals>
+        </execution>
+    </executions>
+</plugin>
+```
+
+---
+
+### 33.12 What to Tell Interviewers
+
+When an MNC interviewer asks *"How did you test your project?"*, here is what to say:
+
+> *"I followed a layered testing strategy. For business logic like GST calculations, stock reservation, and discount rules, I wrote unit tests with JUnit 5 and Mockito. For service-level integration tests, I used Testcontainers to spin up real PostgreSQL and Kafka containers so my tests run against the actual database, not H2. I also wrote Kafka consumer tests specifically to verify idempotency — that duplicate events don't cause double-processing. For controllers, I used @WebMvcTest to validate request validation and error response formats. For coverage reporting, I used JaCoCo and targeted 80%+ on the service layer."*
+
+This answer alone puts you ahead of most candidates with 2–3 years of experience.
+
+---
+
+*End of Document — v1.3*
